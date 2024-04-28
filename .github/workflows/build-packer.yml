@@ -1,0 +1,202 @@
+name: Packer Build Workflow
+
+on:
+  push:
+    branches: [main]
+
+env:
+  PORT: ${{secrets.PORT}}
+  DATABASE_NAME: ${{secrets.DATABASE_NAME}}
+  DATABASE_PASSWORD: ${{secrets.DATABASE_PASSWORD}}
+  DATABASE_USER: ${{secrets.DATABASE_USER}}
+  HOST: ${{secrets.HOST}}
+  ENVIRONMENT: ${{secrets.ENVIRONMENT}}
+  PUBSUB_TOPIC: ${{secrets.PUBSUB_TOPIC}}
+  PUBSUB_SUBSCRIPTION: ${{secrets.PUBSUB_SUBSCRIPTION}}
+  DOMAIN: ${{secrets.DOMAIN}}
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+
+jobs:
+  build:
+    name: Build Packer Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Create .env file
+        run: |
+          touch .env
+
+          cat .env
+
+      - name: Zip folder
+        run: zip -r webapp.zip .
+
+      - name: start mysql server already installed in the image
+        run: |
+          sudo systemctl start mysql.service
+          sudo mysql --version
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "20.x"
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: "check env"
+        run: echo ${{ secrets.DATABASE_NAME }}
+
+      - name: Run Test
+        run: npm test
+
+      - name: Authenticate with Google Cloud Platform
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Use gcloud CLI
+        run: gcloud info
+
+      - name: Install plugins
+        run: packer init packer/gcp.pkr.hcl
+
+      - name: DB_NAME
+        run: |
+          DB_NAME=$(gcloud secrets versions access 1 --secret="db-name")
+          echo "DB_NAME=$DB_NAME" >> $GITHUB_ENV
+
+      - name: DB_USER_NAME
+        run: |
+          DB_USER_NAME=$(gcloud secrets versions access 1 --secret="db-user-name")
+          echo "DB_USER_NAME=$DB_USER_NAME" >> $GITHUB_ENV
+
+      - name: DB_PASSWORD
+        run: |
+          DB_PASSWORD=$(gcloud secrets versions access 1 --secret="db-password")
+          echo "DB_PASSWORD=$DB_PASSWORD" >> $GITHUB_ENV
+
+      - name: DB_HOST
+        run: |
+          DB_HOST=$(gcloud secrets versions access 1 --secret="db-host")
+          echo "DB_HOST=$DB_HOST" >> $GITHUB_ENV
+
+      - name: SERVICE_ACCOUNT
+        run: |
+          SERVICE_ACCOUNT=$(gcloud secrets versions access 1 --secret="webapp-service-account")
+          echo "SERVICE_ACCOUNT=$SERVICE_ACCOUNT" >> $GITHUB_ENV
+
+      - name: ENCRYPTION_KEY
+        run: |
+          ENCRYPTION_KEY=$(gcloud secrets versions access 1 --secret="vm-instance-key")
+          echo "ENCRYPTION_KEY=$ENCRYPTION_KEY" >> $GITHUB_ENV    
+
+      - name: DOMAIN
+        run: |
+          DOMAIN=$(gcloud secrets versions access 1 --secret="domain")
+          echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV   
+
+      - name: REGION
+        run: |
+          REGION=$(gcloud secrets versions access 1 --secret="region")
+          echo "REGION=$REGION" >> $GITHUB_ENV  
+
+      - name: SUBNET
+        run: |
+          SUBNET=$(gcloud secrets versions access 1 --secret="subnet")
+          echo "SUBNET=$SUBNET" >> $GITHUB_ENV
+
+      - name: INSTANCE_GROUP_NAME
+        run: |
+          INSTANCE_GROUP_NAME=$(gcloud secrets versions access 1 --secret="instance-group-name")
+          echo "INSTANCE_GROUP_NAME=$INSTANCE_GROUP_NAME" >> $GITHUB_ENV
+
+      - name: Testing ENV Variables
+        run: echo $DB_HOST 
+
+      - name: Packer build
+        run: |
+          packer build \
+          -var 'project_id=utility-pad-415016' \
+          -var 'source_image=centos-stream-8-v20240110' \
+          -var 'image_family=custom-centos-8' \
+          -var 'zone=us-east1-b' \
+          -var 'ssh_username=packer' \
+          -var 'network=default' \
+          packer
+          IMAGE_ID=$(gcloud compute images list --limit=1 --sort-by=~creationTimestamp --filter="name~'custom-[0-9\-]*'" --uri | grep -o "custom-[0-9\-]*")
+          echo "IMAGE_ID=$IMAGE_ID" >> $GITHUB_ENV
+
+      - name: Instance Template new Image
+        id: create_instance_template
+        run: |
+          TEMPLATE_NAME="webapp-template-${{ github.run_id }}"
+          echo "TEMPLATE_NAME=$TEMPLATE_NAME" >> $GITHUB_ENV
+          echo "Creating instance template with the image ID: $IMAGE_ID"
+          TEMPLATE_PATH=$(gcloud compute instance-templates create $TEMPLATE_NAME \
+            --machine-type=e2-medium \
+            --image-project=${{ secrets.GCP_PROJECT_ID }} \
+            --image=$IMAGE_ID \
+            --boot-disk-type=pd-balanced \
+            --boot-disk-size=50 \
+            --region=$REGION \
+            --subnet=$SUBNET \
+            --scopes=cloud-platform \
+            --instance-template-region=$REGION \
+            --create-disk=auto-delete=yes \
+            --boot-disk-kms-key=$ENCRYPTION_KEY \
+            --tags=deny-rule,allow-rule \
+            --service-account=$SERVICE_ACCOUNT \
+            --metadata=startup-script=$'
+
+              #!/bin/bash
+ 
+              set -e
+
+              file_to_check="/opt/completed.txt" 
+
+              # Check if the file exists
+              if [ -f "$file_to_check" ]; then
+                echo "File exists. Exiting without executing further."
+                exit 0
+              else
+                echo "DATABASE_NAME=${{ env.DB_NAME}}" >> /opt/webapp/.env\n
+                echo "DATABASE_USER=${{ env.DB_NAME }}" >> /opt/webapp/.env\n
+                echo "DATABASE_PASSWORD=${{ env.DB_PASSWORD }}" >> /opt/webapp/.env\n
+                echo "HOST=${{ env.DB_HOST }}" >> /opt/webapp/.env\n
+                echo "PORT=8080" >> /opt/webapp/.env\n
+                echo "DOMAIN=${{ env.DOMAIN }}" >> /opt/webapp/.env\n
+                echo "ENVIRONMENT=prod" >> /opt/webapp/.env\n
+                echo "PUBSUB_SUBSCRIPTION=webapp_subscription" >> /opt/webapp/.env\n
+                echo "PUBSUB_TOPIC=verify_email" >> /opt/webapp/.env\n
+
+              touch /opt/completed.txt
+              fi' --format="value(selfLink)") 
+
+             
+          echo "TEMPLATE_PATH=$TEMPLATE_PATH" >> $GITHUB_ENV
+
+      - name: Set Instance template
+        run: |
+          gcloud compute instance-groups managed set-instance-template $INSTANCE_GROUP_NAME \
+          --template=$TEMPLATE_PATH \
+          --region=$REGION \
+
+      - name: Instance Group Rolling
+        run: |
+          gcloud compute instance-groups managed rolling-action start-update $INSTANCE_GROUP_NAME \
+            --max-unavailable=0 \
+            --version template=$TEMPLATE_PATH \
+            --region $REGION
+
+      - name: Managed instance group refresh 
+        run: |
+          gcloud compute instance-groups managed wait-until $INSTANCE_GROUP_NAME \
+            --version-target-reached \
+            --region $REGION

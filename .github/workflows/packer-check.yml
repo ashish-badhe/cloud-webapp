@@ -1,0 +1,37 @@
+name: Packer Check Workflow
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Packer Status Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup packer
+        uses: hashicorp/setup-packer@main
+        id: setup
+        with:
+          version: latest
+
+      - name: Install plugins
+        run: packer init packer/gcp.pkr.hcl
+
+      - name: Run packer fmt
+        run: packer fmt -check packer/gcp.pkr.hcl
+
+      - name: Run packer validate
+        run: |
+          packer validate \
+          -var 'project_id=utility-pad-415016' \
+          -var 'source_image=centos-stream-8-v20240110' \
+          -var 'image_family=custom-centos-8' \
+          -var 'zone=us-east1-b' \
+          -var 'ssh_username=packer' \
+          -var 'network=default' \
+          packer
